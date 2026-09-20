@@ -1,9 +1,10 @@
 import os
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
+from uuid import uuid4
 
-from flask import Flask, abort, flash, redirect, render_template, request, session, url_for
+from flask import Flask, abort, current_app, flash, redirect, render_template, request, session, url_for
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, inspect, text
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -75,6 +76,7 @@ class Product(db.Model):
     box_price = db.Column(db.Numeric(14, 2), default=0, nullable=False)
     unit_price = db.Column(db.Numeric(14, 2), default=0, nullable=False)
     has_box_presentation = db.Column(db.Boolean, default=False, nullable=False)
+    image_filename = db.Column(db.String(100), nullable=True)
     category = db.relationship("Category")
     subcategory = db.relationship("Subcategory")
     supplier = db.relationship("Supplier", backref="products")
@@ -119,6 +121,8 @@ class Sale(db.Model):
     customer_id = db.Column(db.Integer, db.ForeignKey("customer.id"), nullable=True)
     user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
     total = db.Column(db.Numeric(14, 2), nullable=False)
+    cash_received = db.Column(db.Numeric(14, 2), default=0, nullable=False)
+    change_due = db.Column(db.Numeric(14, 2), default=0, nullable=False)
     status = db.Column(db.String(20), default="CONFIRMADA", nullable=False)
     cancelled_at = db.Column(db.DateTime, nullable=True)
     cancellation_reason = db.Column(db.String(300), nullable=True)
@@ -189,6 +193,38 @@ def audit(user, action, entity, entity_id, details):
     db.session.add(AuditEvent(user_id=user.id, action=action, entity=entity, entity_id=str(entity_id), details=details))
 
 
+def save_product_image(upload):
+    """Valida y guarda una imagen con un nombre aleatorio seguro."""
+    if not upload or not upload.filename:
+        return None
+    data = upload.read(5 * 1024 * 1024 + 1)
+    if len(data) > 5 * 1024 * 1024:
+        raise ValueError("La imagen no puede superar los 5 MB.")
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        extension = "png"
+    elif data.startswith(b"\xff\xd8\xff"):
+        extension = "jpg"
+    elif len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        extension = "webp"
+    else:
+        raise ValueError("La imagen debe estar en formato JPG, PNG o WebP.")
+    upload_folder = current_app.config["PRODUCT_IMAGE_UPLOAD_FOLDER"]
+    os.makedirs(upload_folder, exist_ok=True)
+    filename = f"{uuid4().hex}.{extension}"
+    with open(os.path.join(upload_folder, filename), "wb") as image_file:
+        image_file.write(data)
+    return filename
+
+
+def delete_product_image(filename):
+    if not filename:
+        return
+    safe_filename = os.path.basename(filename)
+    image_path = os.path.join(current_app.config["PRODUCT_IMAGE_UPLOAD_FOLDER"], safe_filename)
+    if os.path.isfile(image_path):
+        os.remove(image_path)
+
+
 def ensure_schema():
     """Actualiza instalaciones SQLite anteriores sin borrar ventas ni stock."""
     additions = {
@@ -197,10 +233,12 @@ def ensure_schema():
             "closed_boxes": "INTEGER NOT NULL DEFAULT 0", "loose_units": "INTEGER NOT NULL DEFAULT 0",
             "box_price": "NUMERIC(14,2) NOT NULL DEFAULT 0", "unit_price": "NUMERIC(14,2) NOT NULL DEFAULT 0",
             "has_box_presentation": "BOOLEAN NOT NULL DEFAULT 0",
+            "image_filename": "VARCHAR(100)",
         },
         "customer": {"discount_percent": "NUMERIC(5,2) NOT NULL DEFAULT 0", "first_name": "VARCHAR(100) NOT NULL DEFAULT ''", "last_name": "VARCHAR(100) NOT NULL DEFAULT ''", "dni": "VARCHAR(30)", "address": "VARCHAR(250) NOT NULL DEFAULT ''", "debt_balance": "NUMERIC(14,2) NOT NULL DEFAULT 0"},
         "supplier": {"company_name": "VARCHAR(160) NOT NULL DEFAULT ''"},
         "sale_item": {"presentation": "VARCHAR(20)", "sale_quantity": "NUMERIC(14,3)", "discount_percent": "NUMERIC(5,2) NOT NULL DEFAULT 0"},
+        "sale": {"cash_received": "NUMERIC(14,2) NOT NULL DEFAULT 0", "change_due": "NUMERIC(14,2) NOT NULL DEFAULT 0"},
     }
     inspector = inspect(db.engine)
     existing_tables = set(inspector.get_table_names())
@@ -234,6 +272,8 @@ def create_app(test_config=None):
         SECRET_KEY=os.environ.get("SECRET_KEY", "desarrollo-cambiar-antes-de-produccion"),
         SQLALCHEMY_DATABASE_URI=os.environ.get("DATABASE_URL", "sqlite:///ferresoft.db"),
         SQLALCHEMY_TRACK_MODIFICATIONS=False,
+        MAX_CONTENT_LENGTH=6 * 1024 * 1024,
+        PRODUCT_IMAGE_UPLOAD_FOLDER=os.path.join(app.static_folder, "uploads", "products"),
     )
     if test_config:
         app.config.update(test_config)
@@ -274,7 +314,7 @@ def create_app(test_config=None):
     @login_required
     def products():
         query = request.args.get("q", "").strip()
-        products_query = Product.query.order_by(Product.name)
+        products_query = Product.query.filter_by(active=True).order_by(Product.name)
         if query:
             pattern = f"%{query}%"
             products_query = products_query.filter(db.or_(Product.name.ilike(pattern), Product.code.ilike(pattern), Product.barcode.ilike(pattern)))
@@ -283,8 +323,15 @@ def create_app(test_config=None):
     @app.route("/products/new", methods=["GET", "POST"])
     @owner_required
     def product_new():
+        form_data, field_errors = {}, {}
         if request.method == "POST":
+            form_data = request.form.to_dict()
+            new_image_filename = None
             try:
+                code = request.form.get("code", "").strip(); barcode = request.form.get("barcode", "").strip() or None
+                if Product.query.filter_by(code=code).first(): field_errors["code"] = "Ya existe un producto con este código."
+                if barcode and Product.query.filter_by(barcode=barcode).first(): field_errors["barcode"] = "Ya existe un producto con este código de barras."
+                if field_errors: raise ValueError("Revise los campos marcados.")
                 units_per_box = int(request.form.get("units_per_box") or 1)
                 closed_boxes = int(request.form.get("closed_boxes") or 0)
                 loose_units = int(request.form.get("loose_units") or 0)
@@ -293,13 +340,15 @@ def create_app(test_config=None):
                 box_price = money(request.form.get("box_price") or 0)
                 unit_price = money(request.form["unit_price"])
                 if has_box_presentation and box_price <= 0: raise ValueError("Debe indicar el precio por caja")
-                product = Product(code=request.form["code"].strip(), barcode=request.form.get("barcode", "").strip() or None,
+                new_image_filename = save_product_image(request.files.get("image"))
+                product = Product(code=code, barcode=barcode,
                     name=request.form["name"].strip(), description=request.form.get("description", "").strip(),
                     purchase_price=money(request.form.get("purchase_price") or 0), sale_price=box_price if has_box_presentation else unit_price,
                     box_price=box_price, unit_price=unit_price, has_box_presentation=has_box_presentation,
                     units_per_box=units_per_box, closed_boxes=closed_boxes, loose_units=loose_units,
                     category_id=request.form.get("category_id") or None, subcategory_id=request.form.get("subcategory_id") or None,
-                    supplier_id=request.form.get("supplier_id") or None, stock=Decimal("0"), minimum_stock=Decimal(request.form.get("minimum_stock", 0)))
+                    supplier_id=request.form.get("supplier_id") or None, stock=Decimal("0"), minimum_stock=Decimal(request.form.get("minimum_stock", 0)),
+                    image_filename=new_image_filename)
                 product.sync_stock()
                 db.session.add(product); db.session.flush()
                 if product.stock:
@@ -307,14 +356,18 @@ def create_app(test_config=None):
                 audit(current_user(), "CREAR_PRODUCTO", "product", product.id, product.name)
                 db.session.commit(); flash("Producto creado.", "success"); return redirect(url_for("products"))
             except Exception as exc:
-                db.session.rollback(); flash(f"No se pudo crear el producto: {exc}", "error")
-        return render_template("product_form.html", product=None, categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all(), suppliers=Supplier.query.filter_by(active=True).order_by(Supplier.name).all())
+                db.session.rollback()
+                if new_image_filename: delete_product_image(new_image_filename)
+                flash(f"No se pudo crear el producto: {exc}", "error")
+        return render_template("product_form.html", product=None, form_data=form_data, field_errors=field_errors, categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all(), suppliers=Supplier.query.filter_by(active=True).order_by(Supplier.name).all())
 
     @app.route("/products/<int:product_id>/edit", methods=["GET", "POST"])
     @owner_required
     def product_edit(product_id):
         product = db.get_or_404(Product, product_id)
         if request.method == "POST":
+            new_image_filename = None
+            old_image_filename = product.image_filename
             try:
                 old_price = product.box_price
                 product.code = request.form["code"].strip(); product.barcode = request.form.get("barcode", "").strip() or None
@@ -329,13 +382,20 @@ def create_app(test_config=None):
                     product.closed_boxes = 0
                     product.units_per_box = 1
                     product.box_price = Decimal("0")
+                if request.files.get("image") and request.files["image"].filename:
+                    new_image_filename = save_product_image(request.files["image"])
+                    product.image_filename = new_image_filename
                 product.sync_stock()
                 audit(current_user(), "EDITAR_PRODUCTO", "product", product.id, product.name)
                 if old_price != product.box_price: audit(current_user(), "CAMBIAR_PRECIO", "product", product.id, f"{old_price} a {product.box_price}")
-                db.session.commit(); flash("Producto actualizado.", "success"); return redirect(url_for("products"))
+                db.session.commit()
+                if new_image_filename and old_image_filename: delete_product_image(old_image_filename)
+                flash("Producto actualizado.", "success"); return redirect(url_for("products"))
             except Exception as exc:
-                db.session.rollback(); flash(f"No se pudo actualizar: {exc}", "error")
-        return render_template("product_form.html", product=product, categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all(), suppliers=Supplier.query.filter_by(active=True).order_by(Supplier.name).all())
+                db.session.rollback()
+                if new_image_filename: delete_product_image(new_image_filename)
+                flash(f"No se pudo actualizar: {exc}", "error")
+        return render_template("product_form.html", product=product, form_data={}, field_errors={}, categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all(), suppliers=Supplier.query.filter_by(active=True).order_by(Supplier.name).all())
 
     @app.route("/products/<int:product_id>/adjust", methods=["POST"])
     @owner_required
@@ -359,6 +419,38 @@ def create_app(test_config=None):
             db.session.rollback(); flash(f"No se pudo ajustar el stock: {exc}", "error")
         return redirect(url_for("products"))
 
+    @app.route("/products/<int:product_id>/restock", methods=["GET", "POST"])
+    @owner_required
+    def product_restock(product_id):
+        product = db.get_or_404(Product, product_id)
+        form_data = {}
+        if request.method == "POST":
+            form_data = request.form.to_dict()
+            try:
+                add_boxes = int(request.form.get("add_boxes") or 0)
+                add_units = int(request.form.get("add_units") or 0)
+                if add_boxes < 0 or add_units < 0: raise ValueError("La reposición no puede ser negativa")
+                added = add_units
+                if product.has_box_presentation:
+                    added += add_boxes * product.units_per_box
+                    product.closed_boxes += add_boxes
+                product.loose_units += add_units
+                if added <= 0: raise ValueError("Indique una cantidad a reponer")
+                old_purchase, old_unit, old_box = product.purchase_price, product.unit_price, product.box_price
+                product.purchase_price = money(request.form.get("purchase_price") or 0)
+                product.unit_price = money(request.form["unit_price"])
+                if product.has_box_presentation:
+                    product.box_price = money(request.form["box_price"])
+                    if product.box_price <= 0: raise ValueError("El precio por caja debe ser mayor a cero")
+                product.sale_price = product.box_price if product.has_box_presentation else product.unit_price
+                product.sync_stock()
+                db.session.add(InventoryMovement(product_id=product.id, user_id=current_user().id, quantity=added, movement_type="REPOSICION", reason="Reposición de mercadería", reference=None))
+                audit(current_user(), "REPOSICION", "product", product.id, f"+{added} unidades; compra {old_purchase}->{product.purchase_price}; venta unidad {old_unit}->{product.unit_price}; venta caja {old_box}->{product.box_price}")
+                db.session.commit(); flash("Reposición y precios actualizados.", "success"); return redirect(url_for("products"))
+            except Exception as exc:
+                db.session.rollback(); flash(f"No se pudo registrar la reposición: {exc}", "error")
+        return render_template("restock_form.html", product=product, form_data=form_data)
+
     @app.route("/products/<int:product_id>/delete", methods=["POST"])
     @owner_required
     def product_delete(product_id):
@@ -381,15 +473,19 @@ def create_app(test_config=None):
     @app.route("/suppliers", methods=["GET", "POST"])
     @owner_required
     def suppliers():
+        form_data, field_errors = {}, {}
         if request.method == "POST":
+            form_data = request.form.to_dict()
             try:
-                supplier = Supplier(name=request.form["name"].strip(), company_name=request.form.get("company_name", "").strip(), phone=request.form.get("phone", "").strip(), email=request.form.get("email", "").strip(), notes=request.form.get("notes", "").strip())
+                name = request.form.get("name", "").strip()
+                if Supplier.query.filter_by(name=name).first(): field_errors["name"] = "Ya existe un proveedor con este nombre."
+                if field_errors: raise ValueError("Revise los campos marcados.")
+                supplier = Supplier(name=name, company_name=request.form.get("company_name", "").strip(), phone=request.form.get("phone", "").strip(), email=request.form.get("email", "").strip(), notes=request.form.get("notes", "").strip())
                 db.session.add(supplier); db.session.flush(); audit(current_user(), "CREAR_PROVEEDOR", "supplier", supplier.id, supplier.name)
                 db.session.commit(); flash("Proveedor agregado.", "success")
             except Exception as exc:
                 db.session.rollback(); flash(f"No se pudo agregar el proveedor: {exc}", "error")
-            return redirect(url_for("suppliers"))
-        return render_template("suppliers.html", suppliers=Supplier.query.order_by(Supplier.name).all())
+        return render_template("suppliers.html", suppliers=Supplier.query.order_by(Supplier.name).all(), form_data=form_data, field_errors=field_errors)
 
     @app.route("/suppliers/<int:supplier_id>/edit", methods=["GET", "POST"])
     @owner_required
@@ -404,6 +500,26 @@ def create_app(test_config=None):
             except Exception as exc:
                 db.session.rollback(); flash(f"No se pudo actualizar: {exc}", "error")
         return render_template("supplier_form.html", supplier=supplier)
+
+    @app.route("/suppliers/<int:supplier_id>")
+    @owner_required
+    def supplier_detail(supplier_id):
+        supplier = db.get_or_404(Supplier, supplier_id)
+        products = Product.query.filter_by(supplier_id=supplier.id, active=True).order_by(Product.name).all()
+        return render_template("supplier_detail.html", supplier=supplier, products=products)
+
+    @app.route("/suppliers/<int:supplier_id>/products/<int:product_id>/remove", methods=["POST"])
+    @owner_required
+    def supplier_remove_product(supplier_id, product_id):
+        supplier = db.get_or_404(Supplier, supplier_id)
+        product = db.get_or_404(Product, product_id)
+        if product.supplier_id != supplier.id:
+            abort(404)
+        product.supplier_id = None
+        audit(current_user(), "QUITAR_PRODUCTO_PROVEEDOR", "product", product.id, f"Producto quitado de {supplier.name}")
+        db.session.commit()
+        flash("Producto quitado del proveedor. El producto continúa disponible en el catálogo.", "success")
+        return redirect(url_for("supplier_detail", supplier_id=supplier.id))
 
     @app.route("/catalog", methods=["GET", "POST"])
     @owner_required
@@ -427,7 +543,9 @@ def create_app(test_config=None):
     @app.route("/customers", methods=["GET", "POST"])
     @login_required
     def customers():
+        form_data, field_errors = {}, {}
         if request.method == "POST":
+            form_data = request.form.to_dict()
             try:
                 discount = Decimal(request.form.get("discount_percent", 0))
                 if not 0 <= discount <= 100: raise ValueError("El descuento debe estar entre 0 y 100")
@@ -435,14 +553,14 @@ def create_app(test_config=None):
                 last_name = request.form["last_name"].strip()
                 dni = request.form.get("dni", "").strip() or None
                 if not first_name or not last_name: raise ValueError("Nombre y apellido son obligatorios")
-                if dni and Customer.query.filter_by(dni=dni).first(): raise ValueError("Ya existe un cliente con ese DNI")
+                if dni and Customer.query.filter_by(dni=dni).first(): field_errors["dni"] = "Ya existe un cliente con este DNI."
+                if field_errors: raise ValueError("Revise los campos marcados.")
                 customer = Customer(name=f"{last_name}, {first_name}", first_name=first_name, last_name=last_name, dni=dni, phone=request.form.get("phone", "").strip(), address=request.form.get("address", "").strip(), condition=request.form.get("condition", "Al dia"), discount_percent=discount)
                 db.session.add(customer); db.session.flush(); audit(current_user(), "CREAR_CLIENTE", "customer", customer.id, customer.name)
                 db.session.commit(); flash("Cliente agregado.", "success")
             except Exception as exc:
                 db.session.rollback(); flash(f"No se pudo agregar el cliente: {exc}", "error")
-            return redirect(url_for("customers"))
-        return render_template("customers.html", customers=Customer.query.order_by(Customer.name).all())
+        return render_template("customers.html", customers=Customer.query.order_by(Customer.name).all(), form_data=form_data, field_errors=field_errors)
 
     @app.route("/customers/<int:customer_id>/edit", methods=["GET", "POST"])
     @owner_required
@@ -474,7 +592,9 @@ def create_app(test_config=None):
             db.session.add(sale); db.session.flush()
             total = Decimal("0")
             for line in lines:
-                product = db.session.get(Product, int(line["product_id"]))
+                product_id = line.get("product_id", line.get("id"))
+                if not product_id: raise ValueError("El carrito contiene un producto sin identificador")
+                product = db.session.get(Product, int(product_id))
                 if not product or not product.active: raise ValueError("Producto inválido o inactivo")
                 presentation = line.get("presentation")
                 sale_quantity = Decimal(str(line["quantity"]))
@@ -499,16 +619,33 @@ def create_app(test_config=None):
                 subtotal = (unit_price * sale_quantity).quantize(Decimal("0.01")); total += subtotal
                 db.session.add(SaleItem(sale_id=sale.id, product_id=product.id, quantity=quantity, sale_quantity=sale_quantity, presentation=presentation, discount_percent=discount, unit_price=unit_price, subtotal=subtotal))
                 db.session.add(InventoryMovement(product_id=product.id, user_id=current_user().id, quantity=-quantity, movement_type="VENTA", reason=f"Venta {presentation.lower()}", reference=f"V-{sale.id}"))
-            paid = sum((money(p["amount"]) for p in payments), Decimal("0"))
-            if paid != total: raise ValueError("La suma de pagos debe coincidir con el total")
+            allowed_methods = {"EFECTIVO", "DEBITO", "CREDITO", "TRANSFERENCIA", "QR"}
+            parsed_payments = []
             for payment in payments:
                 method = payment["method"]
-                if method not in {"EFECTIVO", "DEBITO", "CREDITO"}: raise ValueError("Medio de pago invalido")
-                db.session.add(Payment(sale_id=sale.id, method=method, amount=money(payment["amount"])))
+                amount = money(payment["amount"])
+                if method not in allowed_methods: raise ValueError("Medio de pago inválido")
+                if amount <= 0: raise ValueError("Los importes de pago deben ser mayores a cero")
+                parsed_payments.append([method, amount])
+            paid = sum((amount for _, amount in parsed_payments), Decimal("0"))
+            if paid < total: raise ValueError(f"Pago insuficiente. Faltan {(total - paid):.2f}")
+            change_due = (paid - total).quantize(Decimal("0.01"))
+            cash_received = sum((amount for method, amount in parsed_payments if method == "EFECTIVO"), Decimal("0"))
+            if change_due > cash_received: raise ValueError("El importe excedente sólo puede corresponder a un pago en efectivo")
+            remaining_change = change_due
+            for method, amount in parsed_payments:
+                applied_amount = amount
+                if method == "EFECTIVO" and remaining_change > 0:
+                    reduction = min(applied_amount, remaining_change)
+                    applied_amount -= reduction; remaining_change -= reduction
+                if applied_amount > 0:
+                    db.session.add(Payment(sale_id=sale.id, method=method, amount=applied_amount))
             sale.total = total
+            sale.cash_received = cash_received
+            sale.change_due = change_due
             audit(current_user(), "CONFIRMAR_VENTA", "sale", sale.id, f"Total {total}")
             db.session.commit()
-            return {"ok": True, "sale_id": sale.id, "redirect": url_for("sale_receipt", sale_id=sale.id)}
+            return {"ok": True, "sale_id": sale.id, "change_due": str(change_due), "redirect": url_for("sale_receipt", sale_id=sale.id)}
         except Exception as exc:
             db.session.rollback(); return {"ok": False, "error": str(exc)}, 400
 
@@ -549,8 +686,121 @@ def create_app(test_config=None):
         confirmed = Sale.query.filter_by(status="CONFIRMADA")
         total = confirmed.with_entities(func.coalesce(func.sum(Sale.total), 0)).scalar()
         by_payment = db.session.query(Payment.method, func.sum(Payment.amount)).join(Sale).filter(Sale.status == "CONFIRMADA").group_by(Payment.method).all()
-        return render_template("report_sales.html", total=total, count=confirmed.count(), by_payment=by_payment)
+        sales = confirmed.order_by(Sale.created_at.desc()).all()
+        return render_template(
+            "report_sales.html",
+            total=total,
+            count=confirmed.count(),
+            by_payment=by_payment,
+            daily_summaries=build_daily_sales_summaries(sales),
+            today=datetime.now().strftime("%Y-%m-%d"),
+        )
+
+    @app.route("/reports/sales/daily/<report_date>")
+    @login_required
+    def daily_sales_report(report_date):
+        try:
+            selected_date = datetime.strptime(report_date, "%Y-%m-%d").date()
+        except ValueError:
+            abort(404)
+        start = datetime.combine(selected_date, time.min)
+        end = start + timedelta(days=1)
+        sales = Sale.query.filter(
+            Sale.status == "CONFIRMADA",
+            Sale.created_at >= start,
+            Sale.created_at < end,
+        ).order_by(Sale.created_at).all()
+        summaries = build_daily_sales_summaries(sales)
+        day = summaries[0] if summaries else {
+            "date": selected_date,
+            "sales": [],
+            "sale_count": 0,
+            "total": Decimal("0"),
+            "products": [],
+            "payments": [],
+        }
+        return render_template("daily_close.html", day=day, generated_at=datetime.now())
+
+    @app.route("/reports/sales/range")
+    @login_required
+    def sales_range_report():
+        try:
+            start_date = datetime.strptime(request.args["start_date"], "%Y-%m-%d").date()
+            end_date = datetime.strptime(request.args["end_date"], "%Y-%m-%d").date()
+            if start_date > end_date:
+                raise ValueError("La fecha desde no puede ser posterior a la fecha hasta.")
+        except KeyError:
+            flash("Seleccione la fecha desde y la fecha hasta.", "error")
+            return redirect(url_for("sales_report"))
+        except ValueError as exc:
+            message = str(exc) if "posterior" in str(exc) else "Las fechas seleccionadas no son válidas."
+            flash(message, "error")
+            return redirect(url_for("sales_report"))
+
+        start = datetime.combine(start_date, time.min)
+        end = datetime.combine(end_date, time.min) + timedelta(days=1)
+        sales = Sale.query.filter(
+            Sale.status == "CONFIRMADA",
+            Sale.created_at >= start,
+            Sale.created_at < end,
+        ).order_by(Sale.created_at.desc()).all()
+        daily_summaries = build_daily_sales_summaries(sales)
+        total = sum((Decimal(sale.total) for sale in sales), Decimal("0"))
+        payments = {}
+        for sale in sales:
+            for payment in sale.payments:
+                payments[payment.method] = payments.get(payment.method, Decimal("0")) + Decimal(payment.amount)
+        return render_template(
+            "range_sales_report.html",
+            start_date=start_date,
+            end_date=end_date,
+            sales=sales,
+            total=total,
+            payments=sorted(payments.items()),
+            daily_summaries=daily_summaries,
+            generated_at=datetime.now(),
+        )
 
     with app.app_context():
         db.create_all(); ensure_schema(); seed_data()
     return app
+
+
+def build_daily_sales_summaries(sales):
+    """Agrupa ventas confirmadas por fecha, producto y medio de pago."""
+    days = {}
+    for sale in sales:
+        sale_date = sale.created_at.date()
+        day = days.setdefault(sale_date, {
+            "date": sale_date,
+            "sales": [],
+            "sale_count": 0,
+            "total": Decimal("0"),
+            "products_map": {},
+            "payments_map": {},
+        })
+        day["sales"].append(sale)
+        day["sale_count"] += 1
+        day["total"] += Decimal(sale.total)
+        for item in sale.items:
+            presentation = item.presentation or "UNIDAD"
+            key = (item.product_id, presentation)
+            product = day["products_map"].setdefault(key, {
+                "name": item.product.name,
+                "code": item.product.code,
+                "presentation": presentation,
+                "quantity": Decimal("0"),
+                "amount": Decimal("0"),
+            })
+            product["quantity"] += Decimal(item.sale_quantity if item.sale_quantity is not None else item.quantity)
+            product["amount"] += Decimal(item.subtotal)
+        for payment in sale.payments:
+            current_amount = day["payments_map"].get(payment.method, Decimal("0"))
+            day["payments_map"][payment.method] = current_amount + Decimal(payment.amount)
+
+    result = []
+    for day in days.values():
+        day["products"] = sorted(day.pop("products_map").values(), key=lambda product: (product["name"].lower(), product["presentation"]))
+        day["payments"] = sorted(day.pop("payments_map").items())
+        result.append(day)
+    return sorted(result, key=lambda day: day["date"], reverse=True)
