@@ -1,3 +1,4 @@
+{# Reporte imprimible del cierre diario con productos, pagos y totales. #}
 {% extends 'base.html' %}
 {% block content %}
 <article class="receipt daily-close">
@@ -48,10 +49,7 @@
     </tbody>
   </table>
 
-  {% if day.sales %}
-    <h2>Tickets incluidos</h2>
-    <p>{% for sale in day.sales %}N.º {{ sale.id }}{% if not loop.last %} · {% endif %}{% endfor %}</p>
-  {% endif %}
+  {% include '_report_sales_customers.html' %}
   <p class="legal-note">Documento interno de control. No válido como comprobante fiscal.</p>
 </article>
 {% endblock %}
