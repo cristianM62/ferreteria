@@ -1,3 +1,4 @@
+{# Formulario para reponer mercadería y actualizar precios de un producto. #}
 {% extends 'base.html' %}{% block content %}
 <h1>Reposición de producto</h1>
 <p><b>{{product.name}}</b> · Stock actual: {{product.available_units}} unidades{% if product.has_box_presentation %} ({{product.closed_boxes}} cajas y {{product.loose_units}} unidades sueltas){% endif %}</p>
