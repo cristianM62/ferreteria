@@ -1,7 +1,9 @@
+{# Detalle de un proveedor y los productos asociados a él. #}
 {% extends 'base.html' %}{% block content %}
 <div class="title-row"><div><h1>{{supplier.name}}</h1><p>{{supplier.company_name or 'Proveedor sin empresa especificada'}}</p></div><div class="form-actions"><a class="button action-edit" href="{{url_for('supplier_edit',supplier_id=supplier.id)}}">Editar proveedor</a><a class="button secondary" href="{{url_for('suppliers')}}">Volver</a></div></div>
 <section class="cards"><article><span>Teléfono</span><strong>{{supplier.phone or '—'}}</strong></article><article><span>Correo electrónico</span><strong>{{supplier.email or '—'}}</strong></article><article><span>Productos activos</span><strong>{{products|length}}</strong></article></section>
 {% if supplier.notes %}<section class="panel supplier-notes"><h2>Notas</h2><p>{{supplier.notes}}</p></section>{% endif %}
 <h2>Productos ofrecidos</h2>
-<table><thead><tr><th>Código</th><th>Producto</th><th>Categoría</th><th>Precio de compra</th><th>Precio de venta</th><th>Stock</th><th></th></tr></thead><tbody>{% for p in products %}<tr><td>{{p.code}}</td><td>{{p.name}}{% if p.subcategory %}<small>{{p.subcategory.name}}</small>{% endif %}</td><td>{{p.category.name if p.category else '—'}}</td><td>{{p.purchase_price|ars}}</td><td>{{p.unit_price|ars}}{% if p.has_box_presentation %}<small>Caja: {{p.box_price|ars}}</small>{% endif %}</td><td>{{p.available_units}} unidades</td><td><a class="button action-edit" href="{{url_for('product_edit',product_id=p.id)}}">Editar</a> <a class="button action-stock" href="{{url_for('product_restock',product_id=p.id)}}">Reposición</a><form method="post" class="inline" action="{{url_for('supplier_remove_product',supplier_id=supplier.id,product_id=p.id)}}" onsubmit="return confirm('¿Quitar este producto del proveedor?')"><button class="danger">Quitar del proveedor</button></form></td></tr>{% else %}<tr><td colspan="7">Este proveedor todavía no tiene productos asociados.</td></tr>{% endfor %}</tbody></table>
+{% set supplier_context = true %}
+{% include '_product_table.html' %}
 {% endblock %}
