@@ -1,15 +1,47 @@
+"""Define los modelos, las rutas y la lógica de gestión de FerreSoft."""
+
 import os
-from datetime import datetime, time, timedelta
+import unicodedata
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from uuid import uuid4
 
-from flask import Flask, abort, current_app, flash, redirect, render_template, request, session, url_for
+from flask import (
+    Flask,
+    abort,
+    current_app,
+    flash,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func, inspect, text
+from sqlalchemy import case, func, inspect, text
+from sqlalchemy.ext.hybrid import hybrid_property
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from .barcodes import barcode_image
+from .schema import make_subcategories_independent
+
+
 db = SQLAlchemy()
+
+
+def alphabetical(query):
+    """Orden español por nombre: ignora tildes y mayúsculas, conserva la ñ."""
+    def key(item):
+        name = unicodedata.normalize("NFC", item.name.strip().casefold()).replace("ñ", "n~")
+        normalized = unicodedata.normalize("NFD", name)
+        return ("".join(c for c in normalized if not unicodedata.combining(c)), item.id)
+    return sorted(query.all(), key=key)
+
+
+def local_now():
+    """Hora local sin tzinfo para conservar el formato de la base de datos."""
+    return datetime.now(timezone.utc).astimezone().replace(tzinfo=None)
 
 
 def money(value):
@@ -41,9 +73,6 @@ class Category(db.Model):
 class Subcategory(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
-    category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=False)
-    category = db.relationship("Category")
-    __table_args__ = (db.UniqueConstraint("name", "category_id", name="uq_subcategory_category"),)
 
 
 class Supplier(db.Model):
@@ -59,13 +88,12 @@ class Supplier(db.Model):
 class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     code = db.Column(db.String(60), unique=True, nullable=False)
-    barcode = db.Column(db.String(80), unique=True, nullable=True)
     name = db.Column(db.String(160), nullable=False)
     description = db.Column(db.String(500), default="")
     purchase_price = db.Column(db.Numeric(14, 2), default=0, nullable=False)
     sale_price = db.Column(db.Numeric(14, 2), nullable=False)
     stock = db.Column(db.Numeric(14, 3), default=0, nullable=False)
-    minimum_stock = db.Column(db.Numeric(14, 3), default=0, nullable=False)
+    minimum_stock = db.Column(db.Numeric(14, 3), default=0, nullable=False)  # Cajas o unidades según la presentación.
     active = db.Column(db.Boolean, default=True, nullable=False)
     category_id = db.Column(db.Integer, db.ForeignKey("category.id"), nullable=True)
     subcategory_id = db.Column(db.Integer, db.ForeignKey("subcategory.id"), nullable=True)
@@ -85,8 +113,86 @@ class Product(db.Model):
     def available_units(self):
         return self.closed_boxes * self.units_per_box + self.loose_units
 
+    @hybrid_property
+    def is_stock_critical(self):
+        quantity = self.closed_boxes if self.has_box_presentation else self.available_units
+        return self.active and quantity <= self.minimum_stock
+
+    @is_stock_critical.expression
+    def is_stock_critical(cls):
+        quantity = case(
+            (cls.has_box_presentation.is_(True), cls.closed_boxes),
+            else_=cls.closed_boxes * cls.units_per_box + cls.loose_units,
+        )
+        return db.and_(cls.active.is_(True), quantity <= cls.minimum_stock)
+
     def sync_stock(self):
         self.stock = Decimal(self.available_units)
+
+
+def minimum_stock_value(form):
+    try:
+        value = Decimal(form.get("minimum_stock") or 0)
+        if not value.is_finite() or value < 0 or value != value.to_integral_value():
+            raise ValueError
+    except (InvalidOperation, ValueError):
+        unit = "cajas" if "has_box_presentation" in form else "unidades"
+        raise ValueError(f"El stock mínimo debe ser una cantidad entera de {unit}, mayor o igual a cero.")
+    return value
+
+
+def normalized_product_name(name):
+    return unicodedata.normalize("NFC", " ".join(name.split())).casefold()
+
+
+def product_name_options():
+    """Un nombre por sugerencia, aunque haya varias combinaciones de producto."""
+    names = {}
+    for product in alphabetical(Product.query):
+        names.setdefault(normalized_product_name(product.name), product.name.strip())
+    return list(names.values())
+
+
+def validate_product_identity(form, product_id=None):
+    """Valida la combinación completa; cada selección vacía equivale a None."""
+    errors = {}
+    code = form.get("code", "").strip()
+    name = " ".join(form.get("name", "").split())
+    codes = Product.query.filter_by(code=code)
+    if product_id is not None:
+        codes = codes.filter(Product.id != product_id)
+    if not code:
+        errors["code"] = "Ingresá un código."
+    elif codes.first():
+        errors["code"] = "Ya existe un producto con este código."
+    if not name or len(name) > 160:
+        errors["name"] = "El nombre debe tener entre 1 y 160 caracteres."
+
+    selections = {}
+    for field, model, label in (("category_id", Category, "categoría"), ("subcategory_id", Subcategory, "subcategoría")):
+        value = form.get(field, "").strip()
+        selections[field] = None
+        if value:
+            try:
+                entry_id = int(value)
+                if db.session.get(model, entry_id) is None:
+                    raise ValueError
+                selections[field] = entry_id
+            except ValueError:
+                errors[field] = f"Seleccioná una {label} válida."
+
+    if not any(field in errors for field in ("name", "category_id", "subcategory_id")):
+        candidates = Product.query.filter_by(**selections)
+        if product_id is not None:
+            candidates = candidates.filter(Product.id != product_id)
+        normalized = normalized_product_name(name)
+        for candidate in candidates:
+            if normalized_product_name(candidate.name) == normalized:
+                errors["name"] = "Ya existe un producto con este nombre y la misma combinación de categoría y subcategoría."
+                if not candidate.active:
+                    errors["name"] += " El producto existente está inactivo."
+                break
+    return {"code": code, "name": name, **selections}, errors
 
 
 class InventoryMovement(db.Model):
@@ -97,7 +203,7 @@ class InventoryMovement(db.Model):
     movement_type = db.Column(db.String(30), nullable=False)
     reason = db.Column(db.String(300), nullable=False)
     reference = db.Column(db.String(80), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    created_at = db.Column(db.DateTime, default=local_now, nullable=False)
     product = db.relationship("Product")
     user = db.relationship("User")
 
@@ -126,7 +232,7 @@ class Sale(db.Model):
     status = db.Column(db.String(20), default="CONFIRMADA", nullable=False)
     cancelled_at = db.Column(db.DateTime, nullable=True)
     cancellation_reason = db.Column(db.String(300), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    created_at = db.Column(db.DateTime, default=local_now, nullable=False)
     customer = db.relationship("Customer")
     user = db.relationship("User")
     items = db.relationship("SaleItem", back_populates="sale", cascade="all, delete-orphan")
@@ -162,7 +268,7 @@ class AuditEvent(db.Model):
     entity = db.Column(db.String(60), nullable=False)
     entity_id = db.Column(db.String(60), nullable=False)
     details = db.Column(db.String(500), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    created_at = db.Column(db.DateTime, default=local_now, nullable=False)
     user = db.relationship("User")
 
 
@@ -227,6 +333,7 @@ def delete_product_image(filename):
 
 def ensure_schema():
     """Actualiza instalaciones SQLite anteriores sin borrar ventas ni stock."""
+    make_subcategories_independent(db.engine)
     additions = {
         "product": {
             "subcategory_id": "INTEGER", "supplier_id": "INTEGER", "units_per_box": "INTEGER NOT NULL DEFAULT 1",
@@ -281,7 +388,7 @@ def create_app(test_config=None):
 
     @app.context_processor
     def inject_globals():
-        return {"current_user": current_user(), "today": datetime.now()}
+        return {"current_user": current_user(), "today": local_now()}
 
     @app.template_filter("ars")
     def ars_filter(value):
@@ -291,9 +398,9 @@ def create_app(test_config=None):
     @login_required
     def dashboard():
         confirmed = Sale.query.filter_by(status="CONFIRMADA")
-        today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = local_now().replace(hour=0, minute=0, second=0, microsecond=0)
         daily_total = confirmed.filter(Sale.created_at >= today_start).with_entities(func.coalesce(func.sum(Sale.total), 0)).scalar()
-        critical = Product.query.filter(Product.active.is_(True), Product.stock <= Product.minimum_stock).count()
+        critical = Product.query.filter(Product.is_stock_critical).count()
         return render_template("dashboard.html", daily_total=daily_total, critical=critical, sale_count=confirmed.count())
 
     @app.route("/login", methods=["GET", "POST"])
@@ -314,11 +421,22 @@ def create_app(test_config=None):
     @login_required
     def products():
         query = request.args.get("q", "").strip()
-        products_query = Product.query.filter_by(active=True).order_by(Product.name)
+        products_query = Product.query.filter_by(active=True)
         if query:
             pattern = f"%{query}%"
-            products_query = products_query.filter(db.or_(Product.name.ilike(pattern), Product.code.ilike(pattern), Product.barcode.ilike(pattern)))
-        return render_template("products.html", products=products_query.all(), query=query)
+            products_query = products_query.filter(db.or_(Product.name.ilike(pattern), Product.code.ilike(pattern)))
+        template = "_product_table.html" if request.args.get("partial") == "1" else "products.html"
+        return render_template(template, products=alphabetical(products_query), query=query)
+
+    @app.route("/products/<int:product_id>/barcode")
+    @login_required
+    def product_barcode(product_id):
+        product = db.get_or_404(Product, product_id)
+        try:
+            image = barcode_image(product.code)
+        except ValueError as exc:
+            return render_template("product_barcode.html", product=product, barcode_image=None, barcode_error=str(exc)), 422
+        return render_template("product_barcode.html", product=product, barcode_image=image, barcode_error=None)
 
     @app.route("/products/new", methods=["GET", "POST"])
     @owner_required
@@ -328,26 +446,24 @@ def create_app(test_config=None):
             form_data = request.form.to_dict()
             new_image_filename = None
             try:
-                code = request.form.get("code", "").strip(); barcode = request.form.get("barcode", "").strip() or None
-                if Product.query.filter_by(code=code).first(): field_errors["code"] = "Ya existe un producto con este código."
-                if barcode and Product.query.filter_by(barcode=barcode).first(): field_errors["barcode"] = "Ya existe un producto con este código de barras."
+                identity, field_errors = validate_product_identity(request.form)
                 if field_errors: raise ValueError("Revise los campos marcados.")
                 units_per_box = int(request.form.get("units_per_box") or 1)
                 closed_boxes = int(request.form.get("closed_boxes") or 0)
                 loose_units = int(request.form.get("loose_units") or 0)
                 if units_per_box < 1 or closed_boxes < 0 or loose_units < 0: raise ValueError("Las cantidades no pueden ser negativas")
                 has_box_presentation = "has_box_presentation" in request.form
+                minimum_stock = minimum_stock_value(request.form)
                 box_price = money(request.form.get("box_price") or 0)
                 unit_price = money(request.form["unit_price"])
                 if has_box_presentation and box_price <= 0: raise ValueError("Debe indicar el precio por caja")
                 new_image_filename = save_product_image(request.files.get("image"))
-                product = Product(code=code, barcode=barcode,
-                    name=request.form["name"].strip(), description=request.form.get("description", "").strip(),
+                product = Product(**identity,
+                    description=request.form.get("description", "").strip(),
                     purchase_price=money(request.form.get("purchase_price") or 0), sale_price=box_price if has_box_presentation else unit_price,
                     box_price=box_price, unit_price=unit_price, has_box_presentation=has_box_presentation,
                     units_per_box=units_per_box, closed_boxes=closed_boxes, loose_units=loose_units,
-                    category_id=request.form.get("category_id") or None, subcategory_id=request.form.get("subcategory_id") or None,
-                    supplier_id=request.form.get("supplier_id") or None, stock=Decimal("0"), minimum_stock=Decimal(request.form.get("minimum_stock", 0)),
+                    supplier_id=request.form.get("supplier_id") or None, stock=Decimal(0), minimum_stock=minimum_stock,
                     image_filename=new_image_filename)
                 product.sync_stock()
                 db.session.add(product); db.session.flush()
@@ -356,32 +472,38 @@ def create_app(test_config=None):
                 audit(current_user(), "CREAR_PRODUCTO", "product", product.id, product.name)
                 db.session.commit(); flash("Producto creado.", "success"); return redirect(url_for("products"))
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback()
                 if new_image_filename: delete_product_image(new_image_filename)
                 flash(f"No se pudo crear el producto: {exc}", "error")
-        return render_template("product_form.html", product=None, form_data=form_data, field_errors=field_errors, categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all(), suppliers=Supplier.query.filter_by(active=True).order_by(Supplier.name).all())
+        return render_template("product_form.html", product=None, form_data=form_data, field_errors=field_errors, product_names=product_name_options(), categories=alphabetical(Category.query), subcategories=alphabetical(Subcategory.query), suppliers=alphabetical(Supplier.query.filter_by(active=True)))
 
     @app.route("/products/<int:product_id>/edit", methods=["GET", "POST"])
     @owner_required
     def product_edit(product_id):
         product = db.get_or_404(Product, product_id)
+        form_data = {column.name: getattr(product, column.name) for column in Product.__table__.columns}
+        field_errors = {}
         if request.method == "POST":
+            form_data = request.form.to_dict()
             new_image_filename = None
             old_image_filename = product.image_filename
             try:
+                identity, field_errors = validate_product_identity(request.form, product.id)
+                if field_errors: raise ValueError("Revise los campos marcados.")
                 old_price = product.box_price
-                product.code = request.form["code"].strip(); product.barcode = request.form.get("barcode", "").strip() or None
-                product.name = request.form["name"].strip(); product.description = request.form.get("description", "").strip()
+                product.code = identity["code"]
+                product.name = identity["name"]; product.description = request.form.get("description", "").strip()
                 product.purchase_price = money(request.form.get("purchase_price") or 0); product.box_price = money(request.form.get("box_price") or 0); product.unit_price = money(request.form["unit_price"]); product.has_box_presentation = "has_box_presentation" in request.form; product.sale_price = product.box_price or product.unit_price
-                product.minimum_stock = Decimal(request.form.get("minimum_stock", 0)); product.active = "active" in request.form
-                product.category_id = request.form.get("category_id") or None; product.subcategory_id = request.form.get("subcategory_id") or None; product.supplier_id = request.form.get("supplier_id") or None
+                product.minimum_stock = minimum_stock_value(request.form); product.active = "active" in request.form
+                product.category_id = identity["category_id"]; product.subcategory_id = identity["subcategory_id"]; product.supplier_id = request.form.get("supplier_id") or None
                 if int(request.form.get("units_per_box") or 1) < 1: raise ValueError("Unidades por caja debe ser mayor a cero")
                 product.units_per_box = int(request.form.get("units_per_box") or 1)
                 if not product.has_box_presentation:
                     product.loose_units += product.closed_boxes * product.units_per_box
                     product.closed_boxes = 0
                     product.units_per_box = 1
-                    product.box_price = Decimal("0")
+                    product.box_price = Decimal(0)
                 if request.files.get("image") and request.files["image"].filename:
                     new_image_filename = save_product_image(request.files["image"])
                     product.image_filename = new_image_filename
@@ -392,10 +514,11 @@ def create_app(test_config=None):
                 if new_image_filename and old_image_filename: delete_product_image(old_image_filename)
                 flash("Producto actualizado.", "success"); return redirect(url_for("products"))
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback()
                 if new_image_filename: delete_product_image(new_image_filename)
                 flash(f"No se pudo actualizar: {exc}", "error")
-        return render_template("product_form.html", product=product, form_data={}, field_errors={}, categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all(), suppliers=Supplier.query.filter_by(active=True).order_by(Supplier.name).all())
+        return render_template("product_form.html", product=product, form_data=form_data, field_errors=field_errors, product_names=product_name_options(), categories=alphabetical(Category.query), subcategories=alphabetical(Subcategory.query), suppliers=alphabetical(Supplier.query.filter_by(active=True)))
 
     @app.route("/products/<int:product_id>/adjust", methods=["POST"])
     @owner_required
@@ -416,6 +539,7 @@ def create_app(test_config=None):
             audit(current_user(), "AJUSTAR_STOCK", "product", product.id, f"{quantity}: {reason}")
             db.session.commit(); flash("Stock ajustado.", "success")
         except Exception as exc:
+            current_app.logger.exception("Error al procesar %s", request.path)
             db.session.rollback(); flash(f"No se pudo ajustar el stock: {exc}", "error")
         return redirect(url_for("products"))
 
@@ -448,6 +572,7 @@ def create_app(test_config=None):
                 audit(current_user(), "REPOSICION", "product", product.id, f"+{added} unidades; compra {old_purchase}->{product.purchase_price}; venta unidad {old_unit}->{product.unit_price}; venta caja {old_box}->{product.box_price}")
                 db.session.commit(); flash("Reposición y precios actualizados.", "success"); return redirect(url_for("products"))
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback(); flash(f"No se pudo registrar la reposición: {exc}", "error")
         return render_template("restock_form.html", product=product, form_data=form_data)
 
@@ -462,13 +587,14 @@ def create_app(test_config=None):
             db.session.commit()
             flash("Producto eliminado del catálogo. Su historial se conserva.", "success")
         except Exception as exc:
+            current_app.logger.exception("Error al procesar %s", request.path)
             db.session.rollback(); flash(f"No se pudo eliminar el producto: {exc}", "error")
         return redirect(url_for("products"))
 
     @app.route("/sales/new")
     @login_required
     def sale_new():
-        return render_template("sale_new.html", products=Product.query.filter_by(active=True).order_by(Product.name).all(), customers=Customer.query.filter_by(active=True).order_by(Customer.name).all())
+        return render_template("sale_new.html", products=alphabetical(Product.query.filter_by(active=True)), customers=alphabetical(Customer.query.filter_by(active=True)))
 
     @app.route("/suppliers", methods=["GET", "POST"])
     @owner_required
@@ -484,8 +610,9 @@ def create_app(test_config=None):
                 db.session.add(supplier); db.session.flush(); audit(current_user(), "CREAR_PROVEEDOR", "supplier", supplier.id, supplier.name)
                 db.session.commit(); flash("Proveedor agregado.", "success")
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback(); flash(f"No se pudo agregar el proveedor: {exc}", "error")
-        return render_template("suppliers.html", suppliers=Supplier.query.order_by(Supplier.name).all(), form_data=form_data, field_errors=field_errors)
+        return render_template("suppliers.html", suppliers=alphabetical(Supplier.query), form_data=form_data, field_errors=field_errors)
 
     @app.route("/suppliers/<int:supplier_id>/edit", methods=["GET", "POST"])
     @owner_required
@@ -498,6 +625,7 @@ def create_app(test_config=None):
                 audit(current_user(), "EDITAR_PROVEEDOR", "supplier", supplier.id, supplier.name); db.session.commit(); flash("Proveedor actualizado.", "success")
                 return redirect(url_for("suppliers"))
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback(); flash(f"No se pudo actualizar: {exc}", "error")
         return render_template("supplier_form.html", supplier=supplier)
 
@@ -505,7 +633,7 @@ def create_app(test_config=None):
     @owner_required
     def supplier_detail(supplier_id):
         supplier = db.get_or_404(Supplier, supplier_id)
-        products = Product.query.filter_by(supplier_id=supplier.id, active=True).order_by(Product.name).all()
+        products = alphabetical(Product.query.filter_by(supplier_id=supplier.id, active=True))
         return render_template("supplier_detail.html", supplier=supplier, products=products)
 
     @app.route("/suppliers/<int:supplier_id>/products/<int:product_id>/remove", methods=["POST"])
@@ -524,21 +652,58 @@ def create_app(test_config=None):
     @app.route("/catalog", methods=["GET", "POST"])
     @owner_required
     def catalog():
-        try:
-            if request.method == "POST":
+        if request.method == "POST":
+            try:
                 action = request.form.get("action")
-                if action == "category":
-                    category = Category(name=request.form["name"].strip())
-                    db.session.add(category); db.session.flush(); audit(current_user(), "CREAR_CATEGORIA", "category", category.id, category.name)
-                elif action == "subcategory":
-                    subcategory = Subcategory(name=request.form["name"].strip(), category_id=int(request.form["category_id"]))
-                    db.session.add(subcategory); db.session.flush(); audit(current_user(), "CREAR_SUBCATEGORIA", "subcategory", subcategory.id, subcategory.name)
-                else: raise ValueError("Acción no válida")
-                db.session.commit(); flash("Catálogo actualizado.", "success")
-            return render_template("catalog.html", categories=Category.query.order_by(Category.name).all(), subcategories=Subcategory.query.order_by(Subcategory.name).all())
-        except Exception as exc:
-            db.session.rollback(); flash(f"No se pudo actualizar el catálogo: {exc}", "error")
+
+                def get_entry(model, field):
+                    entry = db.session.get(model, int(request.form.get(field, "0")))
+                    if entry is None:
+                        raise ValueError("La categoría o subcategoría ya no existe.")
+                    return entry
+
+                if action in {"category", "subcategory", "edit_category", "edit_subcategory"}:
+                    name = request.form.get("name", "").strip()
+                    if not name or len(name) > 100:
+                        raise ValueError("El nombre debe tener entre 1 y 100 caracteres.")
+                    is_category = action in {"category", "edit_category"}
+                    model = Category if is_category else Subcategory
+                    entry = get_entry(model, "id") if action.startswith("edit_") else None
+                    duplicates = model.query.filter(func.lower(model.name) == name.lower())
+                    if entry:
+                        duplicates = duplicates.filter(model.id != entry.id)
+                    if duplicates.first():
+                        raise ValueError("Ya existe una categoría con ese nombre." if is_category else "Ya existe una subcategoría con ese nombre.")
+                    if entry is None:
+                        entry = model(name=name)
+                        db.session.add(entry)
+                    else:
+                        entry.name = name
+                    db.session.flush()
+                    audit(current_user(), ("EDITAR_" if action.startswith("edit_") else "CREAR_") + ("CATEGORIA" if is_category else "SUBCATEGORIA"), "category" if is_category else "subcategory", entry.id, entry.name)
+                    message = "Catálogo actualizado."
+                elif action == "delete_subcategory":
+                    entry = get_entry(Subcategory, "id")
+                    Product.query.filter_by(subcategory_id=entry.id).update({Product.subcategory_id: None}, synchronize_session=False)
+                    audit(current_user(), "ELIMINAR_SUBCATEGORIA", "subcategory", entry.id, entry.name)
+                    db.session.delete(entry)
+                    message = "Subcategoría eliminada. Los productos se conservaron con su categoría."
+                elif action == "delete_category":
+                    entry = get_entry(Category, "id")
+                    Product.query.filter_by(category_id=entry.id).update({Product.category_id: None}, synchronize_session=False)
+                    audit(current_user(), "ELIMINAR_CATEGORIA", "category", entry.id, entry.name)
+                    db.session.delete(entry)
+                    message = "Categoría eliminada. Los productos y sus subcategorías se conservaron."
+                else:
+                    raise ValueError("Acción no válida")
+                db.session.commit()
+                flash(message, "success")
+            except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
+                db.session.rollback()
+                flash(f"No se pudo actualizar el catálogo: {exc}", "error")
             return redirect(url_for("catalog"))
+        return render_template("catalog.html", categories=alphabetical(Category.query), subcategories=alphabetical(Subcategory.query))
 
     @app.route("/customers", methods=["GET", "POST"])
     @login_required
@@ -559,8 +724,25 @@ def create_app(test_config=None):
                 db.session.add(customer); db.session.flush(); audit(current_user(), "CREAR_CLIENTE", "customer", customer.id, customer.name)
                 db.session.commit(); flash("Cliente agregado.", "success")
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback(); flash(f"No se pudo agregar el cliente: {exc}", "error")
-        return render_template("customers.html", customers=Customer.query.order_by(Customer.name).all(), form_data=form_data, field_errors=field_errors)
+        return render_template("customers.html", customers=alphabetical(Customer.query.filter_by(active=True)), debt_customers=alphabetical(Customer.query.filter(Customer.debt_balance > 0)), form_data=form_data, field_errors=field_errors)
+
+    @app.route("/customers/<int:customer_id>/delete", methods=["POST"])
+    @owner_required
+    def customer_delete(customer_id):
+        customer = db.get_or_404(Customer, customer_id)
+        try:
+            if customer.active:
+                customer.active = False
+                audit(current_user(), "ELIMINAR_CLIENTE", "customer", customer.id, customer.name)
+                db.session.commit()
+            flash("Cliente eliminado de la lista. Sus ventas anteriores y deudas se conservan.", "success")
+        except Exception as exc:
+            current_app.logger.exception("Error al procesar %s", request.path)
+            db.session.rollback()
+            flash(f"No se pudo eliminar el cliente: {exc}", "error")
+        return redirect(url_for("customers"))
 
     @app.route("/customers/<int:customer_id>/edit", methods=["GET", "POST"])
     @owner_required
@@ -575,6 +757,7 @@ def create_app(test_config=None):
                 customer.discount_percent = discount; audit(current_user(), "EDITAR_CLIENTE", "customer", customer.id, customer.name)
                 db.session.commit(); flash("Cliente actualizado.", "success"); return redirect(url_for("customers"))
             except Exception as exc:
+                current_app.logger.exception("Error al procesar %s", request.path)
                 db.session.rollback(); flash(f"No se pudo actualizar: {exc}", "error")
         return render_template("customer_form.html", customer=customer)
 
@@ -588,9 +771,11 @@ def create_app(test_config=None):
             payments = cart.get("payments", [])
             if not payments: raise ValueError("Debe registrar un pago")
             customer = db.session.get(Customer, int(cart["customer_id"])) if cart.get("customer_id") else None
+            if cart.get("customer_id") and (customer is None or not customer.active):
+                raise ValueError("El cliente seleccionado ya no está disponible. Seleccione otro cliente o quite la selección.")
             sale = Sale(user_id=current_user().id, customer_id=customer.id if customer else None, total=0)
             db.session.add(sale); db.session.flush()
-            total = Decimal("0")
+            total = Decimal(0)
             for line in lines:
                 product_id = line.get("product_id", line.get("id"))
                 if not product_id: raise ValueError("El carrito contiene un producto sin identificador")
@@ -615,7 +800,7 @@ def create_app(test_config=None):
                     product.loose_units -= units; base_price = product.unit_price
                 product.sync_stock()
                 discount = Decimal(customer.discount_percent if customer else 0)
-                unit_price = (base_price * (Decimal("1") - discount / Decimal("100"))).quantize(Decimal("0.01"))
+                unit_price = (base_price * (Decimal(1) - discount / Decimal(100))).quantize(Decimal("0.01"))
                 subtotal = (unit_price * sale_quantity).quantize(Decimal("0.01")); total += subtotal
                 db.session.add(SaleItem(sale_id=sale.id, product_id=product.id, quantity=quantity, sale_quantity=sale_quantity, presentation=presentation, discount_percent=discount, unit_price=unit_price, subtotal=subtotal))
                 db.session.add(InventoryMovement(product_id=product.id, user_id=current_user().id, quantity=-quantity, movement_type="VENTA", reason=f"Venta {presentation.lower()}", reference=f"V-{sale.id}"))
@@ -627,10 +812,10 @@ def create_app(test_config=None):
                 if method not in allowed_methods: raise ValueError("Medio de pago inválido")
                 if amount <= 0: raise ValueError("Los importes de pago deben ser mayores a cero")
                 parsed_payments.append([method, amount])
-            paid = sum((amount for _, amount in parsed_payments), Decimal("0"))
+            paid = sum((amount for _, amount in parsed_payments), Decimal(0))
             if paid < total: raise ValueError(f"Pago insuficiente. Faltan {(total - paid):.2f}")
             change_due = (paid - total).quantize(Decimal("0.01"))
-            cash_received = sum((amount for method, amount in parsed_payments if method == "EFECTIVO"), Decimal("0"))
+            cash_received = sum((amount for method, amount in parsed_payments if method == "EFECTIVO"), Decimal(0))
             if change_due > cash_received: raise ValueError("El importe excedente sólo puede corresponder a un pago en efectivo")
             remaining_change = change_due
             for method, amount in parsed_payments:
@@ -647,6 +832,7 @@ def create_app(test_config=None):
             db.session.commit()
             return {"ok": True, "sale_id": sale.id, "change_due": str(change_due), "redirect": url_for("sale_receipt", sale_id=sale.id)}
         except Exception as exc:
+            current_app.logger.exception("Error al procesar %s", request.path)
             db.session.rollback(); return {"ok": False, "error": str(exc)}, 400
 
     @app.route("/sales")
@@ -673,10 +859,11 @@ def create_app(test_config=None):
                 else: item.product.loose_units += int(item.sale_quantity or item.quantity)
                 item.product.sync_stock()
                 db.session.add(InventoryMovement(product_id=item.product_id, user_id=current_user().id, quantity=item.quantity, movement_type="ANULACION", reason=reason, reference=f"V-{sale.id}"))
-            sale.status = "ANULADA"; sale.cancelled_at = datetime.now(); sale.cancellation_reason = reason
+            sale.status = "ANULADA"; sale.cancelled_at = local_now(); sale.cancellation_reason = reason
             audit(current_user(), "ANULAR_VENTA", "sale", sale.id, reason)
             db.session.commit(); flash("Ticket anulado y stock restituido.", "success")
         except Exception as exc:
+            current_app.logger.exception("Error al procesar %s", request.path)
             db.session.rollback(); flash(f"No se pudo anular: {exc}", "error")
         return redirect(url_for("sales"))
 
@@ -693,14 +880,14 @@ def create_app(test_config=None):
             count=confirmed.count(),
             by_payment=by_payment,
             daily_summaries=build_daily_sales_summaries(sales),
-            today=datetime.now().strftime("%Y-%m-%d"),
+            today=local_now().strftime("%Y-%m-%d"),
         )
 
     @app.route("/reports/sales/daily/<report_date>")
     @login_required
     def daily_sales_report(report_date):
         try:
-            selected_date = datetime.strptime(report_date, "%Y-%m-%d").date()
+            selected_date = date.fromisoformat(report_date)
         except ValueError:
             abort(404)
         start = datetime.combine(selected_date, time.min)
@@ -715,18 +902,18 @@ def create_app(test_config=None):
             "date": selected_date,
             "sales": [],
             "sale_count": 0,
-            "total": Decimal("0"),
+            "total": Decimal(0),
             "products": [],
             "payments": [],
         }
-        return render_template("daily_close.html", day=day, generated_at=datetime.now())
+        return render_template("daily_close.html", day=day, generated_at=local_now())
 
     @app.route("/reports/sales/range")
     @login_required
     def sales_range_report():
         try:
-            start_date = datetime.strptime(request.args["start_date"], "%Y-%m-%d").date()
-            end_date = datetime.strptime(request.args["end_date"], "%Y-%m-%d").date()
+            start_date = date.fromisoformat(request.args["start_date"])
+            end_date = date.fromisoformat(request.args["end_date"])
             if start_date > end_date:
                 raise ValueError("La fecha desde no puede ser posterior a la fecha hasta.")
         except KeyError:
@@ -745,11 +932,11 @@ def create_app(test_config=None):
             Sale.created_at < end,
         ).order_by(Sale.created_at.desc()).all()
         daily_summaries = build_daily_sales_summaries(sales)
-        total = sum((Decimal(sale.total) for sale in sales), Decimal("0"))
+        total = sum((Decimal(sale.total) for sale in sales), Decimal(0))
         payments = {}
         for sale in sales:
             for payment in sale.payments:
-                payments[payment.method] = payments.get(payment.method, Decimal("0")) + Decimal(payment.amount)
+                payments[payment.method] = payments.get(payment.method, Decimal(0)) + Decimal(payment.amount)
         return render_template(
             "range_sales_report.html",
             start_date=start_date,
@@ -758,7 +945,7 @@ def create_app(test_config=None):
             total=total,
             payments=sorted(payments.items()),
             daily_summaries=daily_summaries,
-            generated_at=datetime.now(),
+            generated_at=local_now(),
         )
 
     with app.app_context():
@@ -775,7 +962,7 @@ def build_daily_sales_summaries(sales):
             "date": sale_date,
             "sales": [],
             "sale_count": 0,
-            "total": Decimal("0"),
+            "total": Decimal(0),
             "products_map": {},
             "payments_map": {},
         })
@@ -789,13 +976,13 @@ def build_daily_sales_summaries(sales):
                 "name": item.product.name,
                 "code": item.product.code,
                 "presentation": presentation,
-                "quantity": Decimal("0"),
-                "amount": Decimal("0"),
+                "quantity": Decimal(0),
+                "amount": Decimal(0),
             })
             product["quantity"] += Decimal(item.sale_quantity if item.sale_quantity is not None else item.quantity)
             product["amount"] += Decimal(item.subtotal)
         for payment in sale.payments:
-            current_amount = day["payments_map"].get(payment.method, Decimal("0"))
+            current_amount = day["payments_map"].get(payment.method, Decimal(0))
             day["payments_map"][payment.method] = current_amount + Decimal(payment.amount)
 
     result = []
