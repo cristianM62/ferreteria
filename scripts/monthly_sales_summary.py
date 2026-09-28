@@ -1,18 +1,21 @@
 """Genera un resumen CSV del mes anterior a partir de ventas confirmadas."""
-import csv
-from datetime import date
-from pathlib import Path
-import sys
 
-today = date.today()
+import csv
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from sqlalchemy import func
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app import Sale, create_app, db
-from sqlalchemy import func
 
+# Usar la fecha local, igual que las fechas de venta guardadas por la app.
+today = datetime.now(timezone.utc).astimezone().date()
 first_current = today.replace(day=1)
-last_month = first_current.replace(day=1) - __import__("datetime").timedelta(days=1)
+last_month = first_current - timedelta(days=1)
 month_start = last_month.replace(day=1)
 
 app = create_app()
