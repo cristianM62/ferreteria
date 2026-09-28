@@ -1,6 +1,7 @@
 """Define los modelos, las rutas y la lógica de gestión de FerreSoft."""
 
 import os
+import secrets
 import unicodedata
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -143,6 +144,15 @@ def minimum_stock_value(form):
 
 def normalized_product_name(name):
     return unicodedata.normalize("NFC", " ".join(name.split())).casefold()
+
+
+def generate_unique_product_code():
+    """Genera un código numérico de 12 dígitos que no exista en el catálogo."""
+    for _ in range(100):
+        code = f"{secrets.randbelow(10 ** 12):012d}"
+        if Product.query.filter_by(code=code).first() is None:
+            return code
+    raise RuntimeError("No se pudo generar un código único. Intentá nuevamente.")
 
 
 def product_name_options():
@@ -437,6 +447,11 @@ def create_app(test_config=None):
         except ValueError as exc:
             return render_template("product_barcode.html", product=product, barcode_image=None, barcode_error=str(exc)), 422
         return render_template("product_barcode.html", product=product, barcode_image=image, barcode_error=None)
+
+    @app.route("/products/generate-code")
+    @owner_required
+    def product_generate_code():
+        return {"code": generate_unique_product_code()}
 
     @app.route("/products/new", methods=["GET", "POST"])
     @owner_required

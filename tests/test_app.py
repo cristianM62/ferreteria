@@ -784,6 +784,29 @@ def test_product_barcode_requires_login_and_handles_invalid_codes():
         assert 'data:image/svg' not in response.get_data(as_text=True)
 
 
+def test_owner_generates_random_code_skipping_existing_products(monkeypatch):
+    client, app = app_client(); login(client, 'owner')
+    with app.app_context():
+        product = db.session.get(Product, 1)
+        product.code = '000000000123'
+        db.session.commit()
+    values = iter([123, 456])
+    monkeypatch.setattr('app.secrets.randbelow', lambda limit: next(values))
+    response = client.get('/products/generate-code')
+    assert response.status_code == 200
+    assert response.get_json()['code'] == '000000000456'
+
+
+def test_generate_product_code_is_owner_only_and_button_is_on_new_form():
+    client, _ = app_client(); login(client)
+    assert client.get('/products/generate-code').status_code == 403
+    client.get('/logout'); login(client, 'owner')
+    new_form = client.get('/products/new').get_data(as_text=True)
+    edit_form = client.get('/products/1/edit').get_data(as_text=True)
+    assert 'id="generate-product-code"' in new_form
+    assert 'id="generate-product-code"' not in edit_form
+
+
 def test_owner_deletes_customer_without_erasing_sales_or_debts():
     from decimal import Decimal
     from app import AuditEvent
