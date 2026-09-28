@@ -1,3 +1,4 @@
+{# Reporte imprimible de ventas dentro de un intervalo de fechas. #}
 {% extends 'base.html' %}
 {% block content %}
 <article class="receipt range-report">
@@ -48,6 +49,7 @@
         </tbody>
         <tfoot><tr><th colspan="4">Total del día</th><th>{{ day.total|ars }}</th></tr></tfoot>
       </table>
+      {% include '_report_sales_customers.html' %}
     </section>
   {% else %}
     <p class="empty-state">No hubo ventas confirmadas entre las fechas seleccionadas.</p>
